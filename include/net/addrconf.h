@@ -236,8 +236,10 @@ struct ipv6_stub {
 				 const struct in6_addr *addr);
 	int (*ipv6_sock_mc_drop)(struct sock *sk, int ifindex,
 				 const struct in6_addr *addr);
-	int (*ipv6_dst_lookup)(struct net *net, struct sock *sk,
-			       struct dst_entry **dst, struct flowi6 *fl6);
+	struct dst_entry *(*ipv6_dst_lookup_flow)(struct net *net,
+						  const struct sock *sk,
+						  struct flowi6 *fl6,
+						  const struct in6_addr *final_dst);
 
 	struct fib6_table *(*fib6_get_table)(struct net *net, u32 id);
 	struct fib6_info *(*fib6_lookup)(struct net *net, int oif,
@@ -380,11 +382,6 @@ static inline struct inet6_dev *in6_dev_get(const struct net_device *dev)
 	idev = rcu_dereference(dev->ip6_ptr);
 	if (idev) {
 		refcount_inc(&idev->refcnt);
-		net_log("%s(): dev: %s, inet refcnt: %u, %pS -> %pS -> %pS\n",
-			__func__, dev->name, refcount_read(&idev->refcnt),
-			__builtin_return_address(2),
-			__builtin_return_address(1),
-			__builtin_return_address(0));
 	}
 rcu_read_unlock();
 	return idev;
@@ -402,19 +399,9 @@ void in6_dev_finish_destroy(struct inet6_dev *idev);
 static inline void in6_dev_put(struct inet6_dev *idev)
 {
 	if (!refcount_read(&idev->refcnt)) {
-		net_log("%s(): dev: %s, refcnt is already 0(%u) force return, %pS() -> %pS() -> %pS()\n",
-			__func__, idev->dev->name, refcount_read(&idev->refcnt),
-			__builtin_return_address(2),
-			__builtin_return_address(1),
-			__builtin_return_address(0));
 		return;
 	}
-		
-	net_log("%s(): dev: %s, PRE dec inet refcnt: %u, %pS() -> %pS() -> %pS()\n",
-		__func__, idev->dev->name, refcount_read(&idev->refcnt),
-		__builtin_return_address(2),
-		__builtin_return_address(1),
-		__builtin_return_address(0));
+
 	if (refcount_dec_and_test(&idev->refcnt)) {
 		net_log("%s(): freeing inet dev for %s\n", __func__, idev->dev->name);
 		in6_dev_finish_destroy(idev);
@@ -434,21 +421,11 @@ static inline void in6_dev_put_clear(struct inet6_dev **pidev)
 static inline void __in6_dev_put(struct inet6_dev *idev)
 {
 	refcount_dec(&idev->refcnt);
-	net_log("%s(): dev: %s, inet refcnt: %u, %pS() -> %pS -> %pS()\n",
-		__func__, idev->dev->name, refcount_read(&idev->refcnt),
-		__builtin_return_address(2),
-		__builtin_return_address(1),
-		__builtin_return_address(0));
 }
 
 static inline void in6_dev_hold(struct inet6_dev *idev)
 {
 	refcount_inc(&idev->refcnt);
-	net_log("%s(): dev: %s, inet refcnt: %u, %pS() -> %pS -> %pS()\n",
-		__func__, idev->dev->name, refcount_read(&idev->refcnt),
-		__builtin_return_address(2),
-		__builtin_return_address(1),
-		__builtin_return_address(0));
 }
 
 void inet6_ifa_finish_destroy(struct inet6_ifaddr *ifp);

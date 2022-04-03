@@ -9,11 +9,15 @@
 #include <linux/init.h>
 #include <linux/cpufreq.h>
 #include <linux/cpu.h>
+#include <linux/kthread.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/input.h>
 #include <linux/time.h>
 #include <linux/sysfs.h>
+#include <uapi/linux/sched/types.h>
+
+#include <linux/sched/rt.h>
 
 #define cpu_boost_attr_rw(_name)		\
 static struct kobj_attribute _name##_attr =	\
@@ -43,9 +47,8 @@ struct cpu_sync {
 };
 
 static DEFINE_PER_CPU(struct cpu_sync, sync_info);
-static struct workqueue_struct *cpu_boost_wq;
 
-static struct work_struct input_boost_work;
+static struct kthread_work input_boost_work;
 
 static bool input_boost_enabled;
 
@@ -63,52 +66,47 @@ static bool sched_boost_active;
 
 static struct delayed_work input_boost_rem;
 static u64 last_input_time;
-#define MIN_INPUT_INTERVAL (150 * USEC_PER_MSEC)
+
+static struct kthread_worker cpu_boost_worker;
+static struct task_struct *cpu_boost_worker_thread;
+
+#define MIN_INPUT_INTERVAL (100 * USEC_PER_MSEC)
 
 static ssize_t store_input_boost_freq(struct kobject *kobj,
 				      struct kobj_attribute *attr,
 				      const char *buf, size_t count)
 {
-	int i, ntokens = 0;
 	unsigned int val, cpu;
-	const char *cp = buf;
 	bool enabled = false;
 
-	while ((cp = strpbrk(cp + 1, " :")))
-		ntokens++;
-
-	/* single number: apply to all CPUs */
-	if (!ntokens) {
-		if (sscanf(buf, "%u\n", &val) != 1)
-			return -EINVAL;
-		for_each_possible_cpu(i)
-			per_cpu(sync_info, i).input_boost_freq = val;
+	/* apply to all CPUs */
+		for_each_possible_cpu(cpu) {
+			if (cpumask_intersects(cpumask_of(cpu), cpu_lp_mask))
+				per_cpu(sync_info, cpu).input_boost_freq = val;
+			if (cpumask_intersects(cpumask_of(cpu), cpu_perf_mask))
+				per_cpu(sync_info, cpu).input_boost_freq = val;
+			if (cpumask_intersects(cpumask_of(cpu), cpu_prime_mask))
+				per_cpu(sync_info, cpu).input_boost_freq = val;
+		}
 		goto check_enable;
-	}
-
-	/* CPU:value pair */
-	if (!(ntokens % 2))
-		return -EINVAL;
-
-	cp = buf;
-	for (i = 0; i < ntokens; i += 2) {
-		if (sscanf(cp, "%u:%u", &cpu, &val) != 2)
-			return -EINVAL;
-		if (cpu >= num_possible_cpus())
-			return -EINVAL;
-
-		per_cpu(sync_info, cpu).input_boost_freq = val;
-		cp = strnchr(cp, PAGE_SIZE - (cp - buf), ' ');
-		cp++;
-	}
 
 check_enable:
-	for_each_possible_cpu(i) {
-		if (per_cpu(sync_info, i).input_boost_freq) {
-			enabled = true;
-			break;
-		}
+
+	for_each_possible_cpu(cpu) {
+		if (cpumask_intersects(cpumask_of(cpu), cpu_lp_mask) || per_cpu(sync_info, cpu).input_boost_freq) {
+				enabled = true;
+				break;
+			}
+		if (cpumask_intersects(cpumask_of(cpu), cpu_perf_mask) || per_cpu(sync_info, cpu).input_boost_freq) {
+				enabled = true;
+				break;
+			}
+		if (cpumask_intersects(cpumask_of(cpu), cpu_prime_mask) || per_cpu(sync_info, cpu).input_boost_freq) {
+				enabled = true;
+				break;
+			}
 	}
+
 	input_boost_enabled = enabled;
 
 	return count;
@@ -121,10 +119,23 @@ static ssize_t show_input_boost_freq(struct kobject *kobj,
 	struct cpu_sync *s;
 
 	for_each_possible_cpu(cpu) {
-		s = &per_cpu(sync_info, cpu);
-		cnt += snprintf(buf + cnt, PAGE_SIZE - cnt,
-				"%d:%u ", cpu, s->input_boost_freq);
+		if (cpumask_intersects(cpumask_of(cpu), cpu_lp_mask)) {
+			s = &per_cpu(sync_info, cpu);
+			cnt += snprintf(buf + cnt, PAGE_SIZE - cnt,
+						"%d:%u ", cpu, s->input_boost_freq);
+		}
+		if (cpumask_intersects(cpumask_of(cpu), cpu_perf_mask)) {
+			s = &per_cpu(sync_info, cpu);
+			cnt += snprintf(buf + cnt, PAGE_SIZE - cnt,
+						"%d:%u ", cpu, s->input_boost_freq);
+		}
+		if (cpumask_intersects(cpumask_of(cpu), cpu_prime_mask)) {
+			s = &per_cpu(sync_info, cpu);
+			cnt += snprintf(buf + cnt, PAGE_SIZE - cnt,
+						"%d:%u ", cpu, s->input_boost_freq);
+		}
 	}
+
 	cnt += snprintf(buf + cnt, PAGE_SIZE - cnt, "\n");
 	return cnt;
 }
@@ -169,28 +180,43 @@ static struct notifier_block boost_adjust_nb = {
 
 static void update_policy_online(void)
 {
-	unsigned int i;
+	unsigned int cpu;
 
 	/* Re-evaluate policy to trigger adjust notifier for online CPUs */
 	get_online_cpus();
-	for_each_online_cpu(i) {
-		pr_debug("Updating policy for CPU%d\n", i);
-		cpufreq_update_policy(i);
+	for_each_possible_cpu(cpu) {
+		if (cpu_online(cpu)) {
+			if (cpumask_intersects(cpumask_of(cpu), cpu_lp_mask))
+				cpufreq_update_policy(cpu);
+			if (cpumask_intersects(cpumask_of(cpu), cpu_perf_mask))
+				cpufreq_update_policy(cpu);
+			if (cpumask_intersects(cpumask_of(cpu), cpu_prime_mask))
+				cpufreq_update_policy(cpu);
+		}
 	}
 	put_online_cpus();
 }
 
 static void do_input_boost_rem(struct work_struct *work)
 {
-	unsigned int i, ret;
+	unsigned int cpu, ret;
 	struct cpu_sync *i_sync_info;
 
 	/* Reset the input_boost_min for all CPUs in the system */
 	pr_debug("Resetting input boost min for all CPUs\n");
-	for_each_possible_cpu(i) {
-		i_sync_info = &per_cpu(sync_info, i);
-		i_sync_info->input_boost_min = 0;
+
+	for_each_possible_cpu(cpu) {
+		if (cpumask_intersects(cpumask_of(cpu), cpu_lp_mask))
+			i_sync_info = &per_cpu(sync_info, cpu);
+			i_sync_info->input_boost_min = 0;
+		if (cpumask_intersects(cpumask_of(cpu), cpu_perf_mask))
+			i_sync_info = &per_cpu(sync_info, cpu);
+			i_sync_info->input_boost_min = 0;
+		if (cpumask_intersects(cpumask_of(cpu), cpu_prime_mask))
+			i_sync_info = &per_cpu(sync_info, cpu);
+			i_sync_info->input_boost_min = 0;
 	}
+
 
 	/* Update policies for all online CPUs */
 	update_policy_online();
@@ -203,9 +229,9 @@ static void do_input_boost_rem(struct work_struct *work)
 	}
 }
 
-static void do_input_boost(struct work_struct *work)
+static void do_input_boost(struct kthread_work *work)
 {
-	unsigned int i, ret;
+	unsigned int cpu, ret;
 	struct cpu_sync *i_sync_info;
 
 	cancel_delayed_work_sync(&input_boost_rem);
@@ -216,9 +242,17 @@ static void do_input_boost(struct work_struct *work)
 
 	/* Set the input_boost_min for all CPUs in the system */
 	pr_debug("Setting input boost min for all CPUs\n");
-	for_each_possible_cpu(i) {
-		i_sync_info = &per_cpu(sync_info, i);
-		i_sync_info->input_boost_min = i_sync_info->input_boost_freq;
+
+	for_each_possible_cpu(cpu) {
+		if (cpumask_intersects(cpumask_of(cpu), cpu_lp_mask))
+			i_sync_info = &per_cpu(sync_info, cpu);
+			i_sync_info->input_boost_min = i_sync_info->input_boost_freq;
+		if (cpumask_intersects(cpumask_of(cpu), cpu_perf_mask))
+			i_sync_info = &per_cpu(sync_info, cpu);
+			i_sync_info->input_boost_min = i_sync_info->input_boost_freq;
+		if (cpumask_intersects(cpumask_of(cpu), cpu_prime_mask))
+			i_sync_info = &per_cpu(sync_info, cpu);
+			i_sync_info->input_boost_min = i_sync_info->input_boost_freq;
 	}
 
 	/* Update policies for all online CPUs */
@@ -233,8 +267,7 @@ static void do_input_boost(struct work_struct *work)
 			sched_boost_active = true;
 	}
 
-	queue_delayed_work(cpu_boost_wq, &input_boost_rem,
-					msecs_to_jiffies(input_boost_ms));
+	schedule_delayed_work(&input_boost_rem, msecs_to_jiffies(input_boost_ms));
 }
 
 static void cpuboost_input_event(struct input_handle *handle,
@@ -249,10 +282,10 @@ static void cpuboost_input_event(struct input_handle *handle,
 	if (now - last_input_time < MIN_INPUT_INTERVAL)
 		return;
 
-	if (work_pending(&input_boost_work))
+	if (queuing_blocked(&cpu_boost_worker, &input_boost_work))
 		return;
 
-	queue_work(cpu_boost_wq, &input_boost_work);
+	kthread_queue_work(&cpu_boost_worker, &input_boost_work);
 	last_input_time = ktime_to_us(ktime_get());
 }
 
@@ -332,18 +365,30 @@ static int cpu_boost_init(void)
 {
 	int cpu, ret;
 	struct cpu_sync *s;
+	struct sched_param param = { .sched_priority = MAX_RT_PRIO - 2 };
 
-	cpu_boost_wq = alloc_workqueue("cpuboost_wq", WQ_HIGHPRI, 0);
-	if (!cpu_boost_wq)
+	kthread_init_worker(&cpu_boost_worker);
+	cpu_boost_worker_thread = kthread_run_perf_critical(cpu_perf_mask, kthread_worker_fn,
+		&cpu_boost_worker, "cpu_boost_worker_thread");
+	if (IS_ERR(cpu_boost_worker_thread))
 		return -EFAULT;
 
-	INIT_WORK(&input_boost_work, do_input_boost);
+	sched_setscheduler(cpu_boost_worker_thread, SCHED_FIFO, &param);
+	kthread_init_work(&input_boost_work, do_input_boost);
 	INIT_DELAYED_WORK(&input_boost_rem, do_input_boost_rem);
 
 	for_each_possible_cpu(cpu) {
-		s = &per_cpu(sync_info, cpu);
-		s->cpu = cpu;
+		if (cpumask_intersects(cpumask_of(cpu), cpu_lp_mask))
+			s = &per_cpu(sync_info, cpu);
+			s->cpu = cpu;
+		if (cpumask_intersects(cpumask_of(cpu), cpu_perf_mask))
+			s = &per_cpu(sync_info, cpu);
+			s->cpu = cpu;
+		if (cpumask_intersects(cpumask_of(cpu), cpu_prime_mask))
+			s = &per_cpu(sync_info, cpu);
+			s->cpu = cpu;
 	}
+
 	cpufreq_register_notifier(&boost_adjust_nb, CPUFREQ_POLICY_NOTIFIER);
 
 	cpu_boost_kobj = kobject_create_and_add("cpu_boost",

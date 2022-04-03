@@ -26,8 +26,8 @@ subdir-y += synaptics
 subdir-y += ti
 subdir-y += xilinx
 subdir-y += zte
-subdir-y += samsung
-
+#subdir-y += samsung
+subdir-y += vendor
 
 dtstree		:= $(srctree)/$(src)
 
@@ -52,4 +52,4 @@ targets += $(DTB_LIST)
 
 dtbs: $(addprefix $(obj)/, $(DTB_LIST))
 
-clean-files := dts/*.dtb *.dtb
+clean-files := dts/*.dtb* *.dtb*

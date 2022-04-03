@@ -28,6 +28,7 @@
 #define SCM_INTERRUPTED		1
 #define SCM_V2_EBUSY		-12
 
+static atomic_t scm_call_count = ATOMIC_INIT(0);
 static DEFINE_MUTEX(scm_lock);
 
 /*
@@ -94,7 +95,7 @@ static int scm_remap_error(int err)
 
 #ifdef CONFIG_ARM64
 
-static int __scm_call_armv8_64(u64 x0, u64 x1, u64 x2, u64 x3, u64 x4, u64 x5,
+static int ___scm_call_armv8_64(u64 x0, u64 x1, u64 x2, u64 x3, u64 x4, u64 x5,
 				u64 *ret1, u64 *ret2, u64 *ret3)
 {
 	register u64 r0 asm("x0") = x0;
@@ -105,6 +106,7 @@ static int __scm_call_armv8_64(u64 x0, u64 x1, u64 x2, u64 x3, u64 x4, u64 x5,
 	register u64 r5 asm("x5") = x5;
 	register u64 r6 asm("x6") = 0;
 
+	atomic_inc(&scm_call_count);
 	do {
 		asm volatile(
 			__asmeq("%0", R0_STR)
@@ -138,6 +140,8 @@ static int __scm_call_armv8_64(u64 x0, u64 x1, u64 x2, u64 x3, u64 x4, u64 x5,
 #endif
 	} while (r0 == SCM_INTERRUPTED);
 
+	atomic_dec(&scm_call_count);
+
 	if (ret1)
 		*ret1 = r1;
 	if (ret2)
@@ -148,7 +152,19 @@ static int __scm_call_armv8_64(u64 x0, u64 x1, u64 x2, u64 x3, u64 x4, u64 x5,
 	return r0;
 }
 
-static int __scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
+static int __scm_call_armv8_64(u64 x0, u64 x1, u64 x2, u64 x3, u64 x4, u64 x5,
+				u64 *ret1, u64 *ret2, u64 *ret3)
+{
+	int ret;
+
+	atomic_inc(&scm_call_count);
+	ret = ___scm_call_armv8_64(x0, x1, x2, x3, x4, x5, ret1, ret2, ret3);
+	atomic_dec(&scm_call_count);
+
+	return ret;
+}
+
+static int ___scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
 				u64 *ret1, u64 *ret2, u64 *ret3)
 {
 	register u32 r0 asm("w0") = w0;
@@ -159,6 +175,7 @@ static int __scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
 	register u32 r5 asm("w5") = w5;
 	register u32 r6 asm("w6") = 0;
 
+	atomic_inc(&scm_call_count);
 	do {
 		asm volatile(
 			__asmeq("%0", R0_STR)
@@ -193,6 +210,8 @@ static int __scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
 
 	} while (r0 == SCM_INTERRUPTED);
 
+	atomic_dec(&scm_call_count);
+
 	if (ret1)
 		*ret1 = r1;
 	if (ret2)
@@ -201,6 +220,18 @@ static int __scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
 		*ret3 = r3;
 
 	return r0;
+}
+
+static int __scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
+				u64 *ret1, u64 *ret2, u64 *ret3)
+{
+	int ret;
+
+	atomic_inc(&scm_call_count);
+	ret = ___scm_call_armv8_32(w0, w1, w2, w3, w4, w5, ret1, ret2, ret3);
+	atomic_dec(&scm_call_count);
+
+	return ret;
 }
 
 #else
@@ -216,6 +247,7 @@ static int __scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
 	register u32 r5 asm("r5") = w5;
 	register u32 r6 asm("r6") = 0;
 
+	atomic_inc(&scm_call_count);
 	do {
 		asm volatile(
 			__asmeq("%0", R0_STR)
@@ -243,6 +275,8 @@ static int __scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
 
 	} while (r0 == SCM_INTERRUPTED);
 
+	atomic_dec(&scm_call_count);
+
 	if (ret1)
 		*ret1 = r1;
 	if (ret2)
@@ -251,6 +285,18 @@ static int __scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
 		*ret3 = r3;
 
 	return r0;
+}
+
+static int __scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
+				u64 *ret1, u64 *ret2, u64 *ret3)
+{
+	int ret;
+
+	atomic_inc(&scm_call_count);
+	ret = ___scm_call_armv8_32(w0, w1, w2, w3, w4, w5, ret1, ret2, ret3);
+	atomic_dec(&scm_call_count);
+
+	return ret;
 }
 
 static int __scm_call_armv8_64(u64 x0, u64 x1, u64 x2, u64 x3, u64 x4, u64 x5,
@@ -710,3 +756,8 @@ early_initcall(scm_mem_protection_init);
 #endif
 
 #endif
+
+bool under_scm_call(void)
+{
+	return atomic_read(&scm_call_count);
+}
