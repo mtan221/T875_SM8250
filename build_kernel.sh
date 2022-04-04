@@ -47,4 +47,5 @@ cp -f out/arch/arm64/boot/Image release/
 find out -type f -name "*.ko" -exec cp -Rf "{}" release/modules/system/vendor/lib/modules/ \;
 
 cd release
+tree
 gzip Image
